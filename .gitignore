@@ -1,0 +1,22 @@
+# Owner's untracked source assets (copies live in Broadcast/)
+/assets/
+
+# macOS
+.DS_Store
+
+# Xcode user data
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+project.xcworkspace/xcuserdata/
+
+# Build output
+build/
+DerivedData/
+*.xcresult
+.build/
+/.kitchen/build/
+
+# Local secrets
+Config/Secrets.xcconfig

@@ -1,0 +1,10 @@
+// Shared build settings for every target and configuration.
+//
+// Google OAuth credentials are read from the optional, untracked
+// Config/Secrets.xcconfig (copy Config/Secrets.example.xcconfig).
+// When that file is absent the values stay empty and the build still succeeds.
+
+GOOGLE_CLIENT_ID =
+GOOGLE_CLIENT_SECRET =
+
+#include? "Secrets.xcconfig"
