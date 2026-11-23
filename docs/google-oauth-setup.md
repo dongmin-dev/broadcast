@@ -73,8 +73,17 @@ secrets confidential, which is why PKCE is used). Still keep it out of git, as b
 
 ## 5. Put the values where the app expects them
 
-Create `Config/Secrets.xcconfig` in the repository root. It is git-ignored, so it is never
-committed:
+Create `Config/Secrets.xcconfig` in the repository root. It must never be committed.
+
+First make sure git ignores it. The repository's root `.gitignore` must contain the line
+`/Config/Secrets.xcconfig`; add it if it is missing, then check:
+
+```sh
+git check-ignore -v Config/Secrets.xcconfig   # must print the matching .gitignore rule
+```
+
+If that prints nothing, the file is **not** ignored. Fix `.gitignore` before you create the
+file, so `git add -A` cannot stage your credentials. Then create it:
 
 ```xcconfig
 // Config/Secrets.xcconfig — DO NOT COMMIT
@@ -108,8 +117,9 @@ Google's consent page:
    click **Continue**.
 3. Leave both calendar permissions ticked and click **Continue**. If you untick one, the
    app reports which permission is missing and asks you to sign in again.
-4. The browser shows "Signed in to Google Calendar. You can close this tab." Settings now
-   shows your email address.
+4. The browser says Google has sent the response to the app. Close the tab and go back to
+   Broadcast. Settings shows your email address if sign-in finished, or an error (for
+   example a missing permission) if it did not.
 
 Tokens are stored in your login Keychain under the service `GoogleCalendarKit`.
 **Sign out** in Settings revokes access at Google and deletes them. You can also remove
@@ -124,4 +134,4 @@ access at <https://myaccount.google.com/permissions>.
 | `Error 400: redirect_uri_mismatch` | The client is a *Web application* client. Create a **Desktop app** client instead. |
 | Calendar API answers `403 accessNotConfigured` | Enable the Google Calendar API in this project (step 2). |
 | Signed out after about a week | Expected in testing mode (7-day refresh tokens). Sign in again. |
-| The browser page never says "Signed in" | Another app or firewall blocked `127.0.0.1`, or the app lacks the `network.server` entitlement. |
+| The browser never reaches the "response sent to the app" page | Another app or firewall blocked `127.0.0.1`, or the app lacks the `network.server` entitlement. |

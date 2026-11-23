@@ -30,6 +30,10 @@ public enum GoogleCalendarError: Error, Sendable, Equatable {
     case rateLimited(retryAfter: TimeInterval?)
     /// No network connection, or the host could not be reached.
     case offline
+    /// More pages than the client's safety limit; the results would be incomplete.
+    case tooManyResults
+    /// The configuration cannot produce a valid redirect URL (e.g. a malformed host).
+    case invalidConfiguration(String)
     /// The loopback redirect listener could not be started.
     case redirectListenerFailed(String)
     /// Could not open the browser for sign-in.

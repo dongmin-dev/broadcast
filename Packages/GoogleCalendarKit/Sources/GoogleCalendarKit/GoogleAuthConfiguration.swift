@@ -82,13 +82,13 @@ public struct GoogleAuthConfiguration: Sendable, Hashable {
     }
 
     /// The redirect URI for a listener bound to `port`.
-    func redirectURI(port: UInt16) -> URL {
-        var components = URLComponents()
-        components.scheme = "http"
-        components.host = redirectHost
-        components.port = Int(port)
-        components.path = redirectPath
-        return components.url!
+    /// IPv6 literals such as `::1` are bracketed.
+    func redirectURI(port: UInt16) throws -> URL {
+        let host = redirectHost.contains(":") && !redirectHost.hasPrefix("[") ? "[\(redirectHost)]" : redirectHost
+        guard let url = URL(string: "http://\(host):\(port)\(redirectPath)"), url.host() != nil, url.port == Int(port) else {
+            throw GoogleCalendarError.invalidConfiguration("Cannot build a redirect URI from host \(redirectHost) and path \(redirectPath)")
+        }
+        return url
     }
 }
 

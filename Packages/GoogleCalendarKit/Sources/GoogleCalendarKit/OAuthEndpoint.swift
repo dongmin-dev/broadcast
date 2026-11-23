@@ -136,8 +136,12 @@ struct OAuthEndpoint: Sendable {
 }
 
 extension HTTPURLResponse {
-    /// `Retry-After` in seconds, if present and numeric.
+    /// `Retry-After` in seconds, or `nil` when missing, not numeric, negative or not finite.
     var retryAfter: TimeInterval? {
-        value(forHTTPHeaderField: "Retry-After").flatMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }
+        guard let raw = value(forHTTPHeaderField: "Retry-After"),
+              let seconds = TimeInterval(raw.trimmingCharacters(in: .whitespaces)),
+              seconds.isFinite, seconds >= 0
+        else { return nil }
+        return seconds
     }
 }

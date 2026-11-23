@@ -17,9 +17,15 @@ public protocol CredentialStore: Sendable {
 /// login keychain.
 public struct KeychainCredentialStore: CredentialStore {
     public let service: String
+    private let api: KeychainAPI
 
     public init(service: String) {
+        self.init(service: service, api: .system)
+    }
+
+    init(service: String, api: KeychainAPI) {
         self.service = service
+        self.api = api
     }
 
     private func baseQuery(key: String, dataProtection: Bool) -> [String: Any] {
@@ -32,7 +38,8 @@ public struct KeychainCredentialStore: CredentialStore {
         return query
     }
 
-    /// Runs `body` against the data protection keychain, falling back to the file keychain.
+    /// Runs `body` against the data protection keychain, falling back to the file keychain
+    /// when the process lacks the entitlement for it.
     private func withKeychain<T>(_ body: (_ dataProtection: Bool) throws -> T) throws -> T {
         do {
             return try body(true)
@@ -41,47 +48,88 @@ public struct KeychainCredentialStore: CredentialStore {
         }
     }
 
-    public func data(forKey key: String) throws -> Data? {
-        try withKeychain { dataProtection in
-            var query = baseQuery(key: key, dataProtection: dataProtection)
-            query[kSecReturnData as String] = true
-            query[kSecMatchLimit as String] = kSecMatchLimitOne
-            var result: CFTypeRef?
-            let status = SecItemCopyMatching(query as CFDictionary, &result)
-            switch status {
-            case errSecSuccess: return result as? Data
-            case errSecItemNotFound: return nil
-            default: throw GoogleCalendarError.keychain(status)
-            }
+    private func read(key: String, dataProtection: Bool) throws -> Data? {
+        var query = baseQuery(key: key, dataProtection: dataProtection)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        let (status, result) = api.copyMatching(query)
+        switch status {
+        case errSecSuccess: return result
+        case errSecItemNotFound: return nil
+        default: throw GoogleCalendarError.keychain(status)
         }
     }
 
+    public func data(forKey key: String) throws -> Data? {
+        // Without the entitlement, a data protection lookup can report "not found" (rather
+        // than errSecMissingEntitlement) while writes fell back to the file keychain, so a
+        // miss there is not final: always look in the file keychain too.
+        let protected: Data?
+        do {
+            protected = try read(key: key, dataProtection: true)
+        } catch GoogleCalendarError.keychain(errSecMissingEntitlement) {
+            protected = nil
+        }
+        if let protected { return protected }
+        return try read(key: key, dataProtection: false)
+    }
+
     public func setData(_ data: Data, forKey key: String) throws {
-        try withKeychain { dataProtection in
+        let wroteToDataProtection = try withKeychain { dataProtection in
             let query = baseQuery(key: key, dataProtection: dataProtection)
             let attributes: [String: Any] = [
                 kSecValueData as String: data,
                 kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             ]
-            var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+            var status = api.update(query, attributes)
             if status == errSecItemNotFound {
                 var addQuery = query
                 addQuery.merge(attributes) { _, new in new }
                 addQuery[kSecAttrLabel as String] = "\(service) (\(key))"
-                status = SecItemAdd(addQuery as CFDictionary, nil)
+                status = api.add(addQuery)
             }
             guard status == errSecSuccess else { throw GoogleCalendarError.keychain(status) }
+            return dataProtection
+        }
+        // Don't leave an older copy in the file keychain that a later read could return.
+        if wroteToDataProtection { try? delete(key: key, dataProtection: false) }
+    }
+
+    private func delete(key: String, dataProtection: Bool) throws {
+        let status = api.delete(baseQuery(key: key, dataProtection: dataProtection))
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw GoogleCalendarError.keychain(status)
         }
     }
 
+    /// Deletes the item from both keychains.
     public func removeData(forKey key: String) throws {
-        try withKeychain { dataProtection in
-            let status = SecItemDelete(baseQuery(key: key, dataProtection: dataProtection) as CFDictionary)
-            guard status == errSecSuccess || status == errSecItemNotFound else {
-                throw GoogleCalendarError.keychain(status)
-            }
+        do {
+            try delete(key: key, dataProtection: true)
+        } catch GoogleCalendarError.keychain(errSecMissingEntitlement) {
+            // Nothing can be stored there either.
         }
+        try delete(key: key, dataProtection: false)
     }
+}
+
+/// The Security framework calls the Keychain store makes; replaceable in tests.
+struct KeychainAPI: Sendable {
+    var copyMatching: @Sendable (_ query: [String: Any]) -> (OSStatus, Data?)
+    var add: @Sendable (_ attributes: [String: Any]) -> OSStatus
+    var update: @Sendable (_ query: [String: Any], _ attributes: [String: Any]) -> OSStatus
+    var delete: @Sendable (_ query: [String: Any]) -> OSStatus
+
+    static let system = KeychainAPI(
+        copyMatching: { query in
+            var result: CFTypeRef?
+            let status = SecItemCopyMatching(query as CFDictionary, &result)
+            return (status, result as? Data)
+        },
+        add: { SecItemAdd($0 as CFDictionary, nil) },
+        update: { SecItemUpdate($0 as CFDictionary, $1 as CFDictionary) },
+        delete: { SecItemDelete($0 as CFDictionary) }
+    )
 }
 
 /// A non-persistent store for tests and SwiftUI previews.

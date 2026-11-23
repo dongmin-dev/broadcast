@@ -274,4 +274,78 @@ struct GoogleAuthTests {
         #expect(try store.loadCredential()?.refreshToken == "1//refresh-1")
         #expect(transport.requests(to: "oauth2.googleapis.com", path: "/revoke").map { formBody($0)["token"] } == ["1//old"])
     }
+
+    @Test("Signing in again with the same account does not revoke the grant")
+    func reSignInSameAccount() async throws {
+        let store = InMemoryCredentialStore()
+        try store.saveCredential(signedInCredential(expiry: .distantFuture, refreshToken: "1//old", email: "Me@Example.com"))
+        let transport = googleStub()
+        let auth = GoogleAuth(configuration: testConfiguration, store: store, transport: transport, userAgent: StubUserAgent())
+        try await auth.signIn()
+        #expect(try store.loadCredential()?.refreshToken == "1//refresh-1")
+        #expect(transport.requests(to: "oauth2.googleapis.com", path: "/revoke").isEmpty)
+    }
+
+    @Test("Signing in again does not revoke when the previous account is unknown")
+    func reSignInUnknownAccount() async throws {
+        let store = InMemoryCredentialStore()
+        try store.saveCredential(signedInCredential(expiry: .distantFuture, refreshToken: "1//old", email: nil))
+        let transport = googleStub()
+        let auth = GoogleAuth(configuration: testConfiguration, store: store, transport: transport, userAgent: StubUserAgent())
+        try await auth.signIn()
+        #expect(transport.requests(to: "oauth2.googleapis.com", path: "/revoke").isEmpty)
+    }
+
+    @Test("Signing out while a replacement sign-in revokes the old account leaves the user signed out")
+    func signOutDuringReplacement() async throws {
+        let store = InMemoryCredentialStore()
+        try store.saveCredential(signedInCredential(expiry: .distantFuture, refreshToken: "1//old", email: "old@example.com"))
+        let transport = StubTransport { request in
+            switch request.url?.path {
+            case "/token": return (200, [:], tokenJSON)
+            case "/revoke":
+                try? await Task.sleep(for: .milliseconds(300))
+                return (200, [:], Data())
+            default: return (200, [:], json(#"{"id":"me@example.com"}"#))
+            }
+        }
+        let auth = GoogleAuth(configuration: testConfiguration, store: store, transport: transport, userAgent: StubUserAgent())
+        let signIn = Task { try await auth.signIn() }
+        while transport.requests(to: "oauth2.googleapis.com", path: "/revoke").isEmpty {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try await auth.signOut()
+        await #expect(throws: GoogleCalendarError.signInCancelled) { try await signIn.value }
+        #expect(!auth.isSignedIn)
+        #expect(auth.accountEmail == nil)
+        #expect(try store.loadCredential() == nil)
+    }
+
+    @Test("Concurrent 401 retries all use the refreshed token while the email lookup is slow")
+    func concurrentRefreshCommitsBeforeReturning() async throws {
+        let store = InMemoryCredentialStore()
+        try store.saveCredential(signedInCredential(expiry: .distantFuture, email: nil))
+        let transport = StubTransport { request in
+            switch request.url?.path {
+            case "/token":
+                try await Task.sleep(for: .milliseconds(20))
+                return (200, [:], json(#"{"access_token":"ya29.new","expires_in":3600}"#))
+            case "/calendar/v3/users/me/calendarList/primary":
+                try await Task.sleep(for: .milliseconds(150))
+                return (200, [:], json(#"{"id":"me@example.com"}"#))
+            default:
+                let authorized = request.value(forHTTPHeaderField: "Authorization") == "Bearer ya29.new"
+                return authorized ? (200, [:], json(#"{"items":[]}"#)) : (401, [:], Data())
+            }
+        }
+        let auth = GoogleAuth(configuration: testConfiguration, store: store, transport: transport, userAgent: StubUserAgent())
+        let client = GoogleCalendarClient(auth: auth, transport: transport)
+        async let a = client.calendars()
+        async let b = client.calendars()
+        let (first, second) = try await (a, b)
+        #expect(first.isEmpty && second.isEmpty)
+        #expect(transport.requests(to: "oauth2.googleapis.com", path: "/token").count == 1)
+        #expect(auth.accountEmail == "me@example.com")
+        #expect(try store.loadCredential()?.accessToken == "ya29.new")
+    }
 }

@@ -28,6 +28,7 @@ public final class GoogleAuth: AccessTokenProvider {
 
     @ObservationIgnored private var credential: StoredCredential?
     @ObservationIgnored private var refreshTask: Task<StoredCredential, any Error>?
+    @ObservationIgnored private var refreshGeneration = 0
     @ObservationIgnored private var signInTask: Task<Void, any Error>?
     @ObservationIgnored private let store: any CredentialStore
     @ObservationIgnored private let endpoint: OAuthEndpoint
@@ -78,10 +79,14 @@ public final class GoogleAuth: AccessTokenProvider {
             signInTask = nil
             isSigningIn = false
         }
-        try await withTaskCancellationHandler {
-            try await task.value
-        } onCancel: {
-            task.cancel()
+        do {
+            try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+        } catch is CancellationError {
+            throw GoogleCalendarError.signInCancelled
         }
     }
 
@@ -97,7 +102,7 @@ public final class GoogleAuth: AccessTokenProvider {
         } catch is CancellationError {
             throw GoogleCalendarError.signInCancelled
         }
-        let redirectURI = Self.redirectURI(from: redirect)
+        let redirectURI = try Self.redirectURI(from: redirect)
         let request = AuthorizationRequest(configuration: configuration, redirectURI: redirectURI, pkce: pkce, state: state)
         let code = try request.authorizationCode(from: redirect)
         let tokens = try await endpoint.exchange(code: code, request: request)
@@ -123,10 +128,19 @@ public final class GoogleAuth: AccessTokenProvider {
         newCredential.email = try? await fetchAccountEmail(accessToken: tokens.accessToken)
         try Task.checkCancellation()
 
-        // Replace any previous account. Revoke its refresh token if it differs.
-        if let old = credential, old.refreshToken != refreshToken {
+        // Replace any previous session. Revoking at Google revokes the whole grant for the
+        // account, so only revoke the old token when it is known to belong to a different
+        // account; otherwise it would also invalidate the tokens just issued.
+        if let old = credential, old.refreshToken != refreshToken,
+           let oldEmail = old.email, let newEmail = newCredential.email,
+           oldEmail.caseInsensitiveCompare(newEmail) != .orderedSame {
             try? await endpoint.revoke(token: old.refreshToken)
         }
+        // signOut() may have run during the last suspension; it cancels this task.
+        try Task.checkCancellation()
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshGeneration += 1
         try store.saveCredential(newCredential)
         apply(newCredential)
     }
@@ -137,6 +151,7 @@ public final class GoogleAuth: AccessTokenProvider {
         signInTask?.cancel()
         refreshTask?.cancel()
         refreshTask = nil
+        refreshGeneration += 1
         let old = credential
         try store.removeCredential()
         apply(nil)
@@ -159,29 +174,34 @@ public final class GoogleAuth: AccessTokenProvider {
         return try await refreshedCredential().accessToken
     }
 
-    /// Refreshes the access token, sharing one in-flight request between callers.
+    /// Refreshes the access token, sharing one in-flight task between callers. The task
+    /// also commits the new credential, so every caller sees it once the task finishes.
     private func refreshedCredential() async throws -> StoredCredential {
         if let refreshTask { return try await refreshTask.value }
         guard let current = credential else { throw GoogleCalendarError.notSignedIn }
-        let endpoint = self.endpoint
-        let now = self.now
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        // Inherits the main actor, and starts only after `refreshTask` is assigned below.
         let task = Task<StoredCredential, any Error> {
+            defer { if refreshGeneration == generation { refreshTask = nil } }
+            return try await performRefresh(from: current)
+        }
+        refreshTask = task
+        return try await task.value
+    }
+
+    private func performRefresh(from current: StoredCredential) async throws -> StoredCredential {
+        do {
             let tokens = try await endpoint.refresh(refreshToken: current.refreshToken)
             var updated = current
             updated.accessToken = tokens.accessToken
             updated.accessTokenExpiry = now().addingTimeInterval(tokens.expiresIn)
             if let rotated = tokens.refreshToken { updated.refreshToken = rotated }
             if let scopes = tokens.scopes { updated.grantedScopes = scopes }
-            return updated
-        }
-        refreshTask = task
-        defer { if refreshTask == task { refreshTask = nil } }
-        do {
-            var updated = try await task.value
             if updated.email == nil {
                 updated.email = try? await fetchAccountEmail(accessToken: updated.accessToken)
             }
-            // Ignore the result if the user signed out or switched accounts meanwhile.
+            // Drop the result if the user signed out or switched accounts meanwhile.
             guard credential?.refreshToken == current.refreshToken else { throw GoogleCalendarError.notSignedIn }
             commitRefresh(updated)
             return updated
@@ -225,10 +245,13 @@ public final class GoogleAuth: AccessTokenProvider {
         return try JSONDecoder().decode(Primary.self, from: data).id
     }
 
-    private static func redirectURI(from redirect: URL) -> URL {
-        var components = URLComponents(url: redirect, resolvingAgainstBaseURL: false)!
+    private static func redirectURI(from redirect: URL) throws -> URL {
+        guard var components = URLComponents(url: redirect, resolvingAgainstBaseURL: false) else {
+            throw GoogleCalendarError.invalidResponse("Malformed redirect URL")
+        }
         components.query = nil
         components.fragment = nil
-        return components.url!
+        guard let url = components.url else { throw GoogleCalendarError.invalidResponse("Malformed redirect URL") }
+        return url
     }
 }

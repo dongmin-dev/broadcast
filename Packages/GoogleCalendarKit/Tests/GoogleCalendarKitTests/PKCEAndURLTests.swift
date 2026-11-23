@@ -79,10 +79,14 @@ struct AuthorizationURLTests {
     }
 
     @Test("Redirect URI is a loopback URL with the bound port")
-    func redirectURI() {
-        #expect(testConfiguration.redirectURI(port: 61000).absoluteString == "http://127.0.0.1:61000/oauth2redirect")
+    func redirectURI() throws {
+        #expect(try testConfiguration.redirectURI(port: 61000).absoluteString == "http://127.0.0.1:61000/oauth2redirect")
         let custom = GoogleAuthConfiguration(clientID: "id", redirectPath: "callback")
-        #expect(custom.redirectURI(port: 1).absoluteString == "http://127.0.0.1:1/callback")
+        #expect(try custom.redirectURI(port: 1).absoluteString == "http://127.0.0.1:1/callback")
+        let ipv6 = GoogleAuthConfiguration(clientID: "id", redirectHost: "::1")
+        #expect(try ipv6.redirectURI(port: 5000).absoluteString == "http://[::1]:5000/oauth2redirect")
+        let bad = GoogleAuthConfiguration(clientID: "id", redirectHost: "bad host/")
+        #expect(throws: GoogleCalendarError.self) { try bad.redirectURI(port: 5000) }
     }
 
     @Test("Redirect parsing validates state and surfaces errors")

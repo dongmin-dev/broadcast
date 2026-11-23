@@ -45,7 +45,7 @@ public struct LoopbackAuthorizationUserAgent: AuthorizationUserAgent {
         let server = try LoopbackRedirectServer(host: configuration.redirectHost, port: configuration.redirectPort, path: configuration.redirectPath)
         defer { server.stop() }
         let port = try await server.start()
-        let redirectURI = configuration.redirectURI(port: port)
+        let redirectURI = try configuration.redirectURI(port: port)
         guard await open(makeAuthorizationURL(redirectURI)) else {
             throw GoogleCalendarError.browserUnavailable
         }
@@ -81,6 +81,7 @@ final class LoopbackRedirectServer: Sendable {
 
     init(host: String, port: UInt16?, path: String) throws {
         self.path = path
+        let host = host.hasPrefix("[") && host.hasSuffix("]") ? String(host.dropFirst().dropLast()) : host
         self.host = host
         let parameters = NWParameters.tcp
         parameters.acceptLocalOnly = true
@@ -102,7 +103,17 @@ final class LoopbackRedirectServer: Sendable {
         }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                state.withLock { $0.portContinuation = continuation }
+                // Register under the same lock stop() uses, so a stop that already happened
+                // (cancellation won the race) resolves the wait instead of hanging.
+                let alreadyStopped = state.withLock { state in
+                    if state.stopped { return true }
+                    state.portContinuation = continuation
+                    return false
+                }
+                if alreadyStopped {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
                 listener.stateUpdateHandler = { [weak self] newState in
                     self?.listenerStateChanged(newState)
                 }
@@ -216,8 +227,10 @@ final class LoopbackRedirectServer: Sendable {
     }
 
     static func page(succeeded: Bool) -> String {
+        // The app still has to exchange the code and check the granted permissions, so this
+        // page must not claim the sign-in succeeded.
         let message = succeeded
-            ? "Signed in to Google Calendar. You can close this tab and return to the app."
+            ? "Google has sent the response to the app. Return to the app to see whether sign-in finished. You can close this tab."
             : "Sign-in was not completed. You can close this tab and try again from the app."
         return """
         <!doctype html><html><head><meta charset="utf-8"><title>Google Calendar sign-in</title>\

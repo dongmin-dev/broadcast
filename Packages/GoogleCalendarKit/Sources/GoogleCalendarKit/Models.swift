@@ -8,15 +8,18 @@ public struct GoogleCalendar: Sendable, Hashable, Identifiable {
     /// Background colour as a hex string such as `#9fe1e7`.
     public var colorHex: String?
     public var isPrimary: Bool
-    /// Whether the calendar is shown in the Google Calendar UI.
+    /// Whether the calendar's events are shown in the Google Calendar UI.
     public var isSelected: Bool
+    /// Whether the user hid the calendar from the calendar list in Google Calendar.
+    public var isHidden: Bool
 
-    public init(id: String, name: String, colorHex: String?, isPrimary: Bool, isSelected: Bool) {
+    public init(id: String, name: String, colorHex: String?, isPrimary: Bool, isSelected: Bool, isHidden: Bool = false) {
         self.id = id
         self.name = name
         self.colorHex = colorHex
         self.isPrimary = isPrimary
         self.isSelected = isSelected
+        self.isHidden = isHidden
     }
 }
 
@@ -77,6 +80,7 @@ struct CalendarListPage: Decodable {
         let backgroundColor: String?
         let primary: Bool?
         let selected: Bool?
+        let hidden: Bool?
         let deleted: Bool?
     }
 
@@ -91,7 +95,8 @@ extension GoogleCalendar {
             name: entry.summaryOverride ?? entry.summary ?? entry.id,
             colorHex: entry.backgroundColor,
             isPrimary: entry.primary ?? false,
-            isSelected: entry.selected ?? false
+            isSelected: entry.selected ?? false,
+            isHidden: entry.hidden ?? false
         )
     }
 }

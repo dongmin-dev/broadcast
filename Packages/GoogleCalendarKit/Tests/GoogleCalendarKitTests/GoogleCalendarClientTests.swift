@@ -177,21 +177,22 @@ struct GoogleCalendarClientTests {
     func calendars() async throws {
         let transport = StubTransport { request in
             #expect(request.url?.path == "/calendar/v3/users/me/calendarList")
+            #expect(queryItems(request.url!)["showHidden"] == "true")
             #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer token-1")
             if queryItems(request.url!)["pageToken"] == "p2" {
-                return (200, [:], json(##"{"items":[{"id":"team@group.calendar.google.com","summary":"Team","summaryOverride":"My Team","backgroundColor":"#9fe1e7"},{"id":"gone","summary":"Gone","deleted":true}]}"##))
+                return (200, [:], json(##"{"items":[{"id":"team@group.calendar.google.com","summary":"Team","summaryOverride":"My Team","backgroundColor":"#9fe1e7","hidden":true},{"id":"gone","summary":"Gone","deleted":true}]}"##))
             }
             return (200, [:], json(##"{"items":[{"id":"me@example.com","summary":"me@example.com","backgroundColor":"#4986e7","primary":true,"selected":true}],"nextPageToken":"p2"}"##))
         }
         let calendars = try await makeClient(transport).calendars()
         #expect(calendars == [
             GoogleCalendar(id: "me@example.com", name: "me@example.com", colorHex: "#4986e7", isPrimary: true, isSelected: true),
-            GoogleCalendar(id: "team@group.calendar.google.com", name: "My Team", colorHex: "#9fe1e7", isPrimary: false, isSelected: false),
+            GoogleCalendar(id: "team@group.calendar.google.com", name: "My Team", colorHex: "#9fe1e7", isPrimary: false, isSelected: false, isHidden: true),
         ])
         #expect(transport.requests.count == 2)
     }
 
-    @Test("Event requests use singleEvents, startTime order and the time range")
+    @Test("Event requests use singleEvents, startTime order and a padded time range")
     func eventQuery() async throws {
         let transport = StubTransport { _ in (200, [:], json(#"{"items":[]}"#)) }
         _ = try await makeClient(transport).events(calendarIDs: ["primary"], from: from, to: to)
@@ -201,8 +202,9 @@ struct GoogleCalendarClientTests {
         let query = queryItems(request.url!)
         #expect(query["singleEvents"] == "true")
         #expect(query["orderBy"] == "startTime")
-        #expect(query["timeMin"] == "2026-11-24T00:00:00Z")
-        #expect(query["timeMax"] == "2026-11-25T00:00:00Z")
+        // Padded by 26 h on both sides so all-day events in other calendar time zones are found.
+        #expect(query["timeMin"] == "2026-11-22T22:00:00Z")
+        #expect(query["timeMax"] == "2026-11-26T02:00:00Z")
         #expect(query["maxResults"] == "250")
         #expect(query["showDeleted"] == nil)
         #expect(query["pageToken"] == nil)
@@ -359,5 +361,74 @@ struct GoogleCalendarClientTests {
                               transport: StubTransport { _ in (500, [:], Data()) }, userAgent: StubUserAgent())
         let client = GoogleCalendarClient(auth: auth, transport: StubTransport { _ in (200, [:], Data()) })
         await #expect(throws: GoogleCalendarError.notSignedIn) { try await client.calendars() }
+    }
+
+    @Test("All-day events from a calendar in another time zone are matched in allDayTimeZone")
+    func allDayAcrossTimeZones() async throws {
+        // Seoul morning: 2026-11-24 00:00–12:00 KST = 2026-11-23T15:00Z – 2026-11-24T03:00Z.
+        let morningStart = Date(timeIntervalSince1970: 1_795_478_400 - 9 * 3600)
+        let morningEnd = morningStart.addingTimeInterval(12 * 3600)
+        let transport = StubTransport { _ in
+            (200, [:], json(#"""
+            {"timeZone":"America/Los_Angeles","items":[
+              {"id":"today","status":"confirmed","start":{"date":"2026-11-24"},"end":{"date":"2026-11-25"}},
+              {"id":"yesterday","status":"confirmed","start":{"date":"2026-11-23"},"end":{"date":"2026-11-24"}},
+              {"id":"timed-before","status":"confirmed","start":{"dateTime":"2026-11-23T10:00:00Z"},"end":{"dateTime":"2026-11-23T11:00:00Z"}},
+              {"id":"timed-inside","status":"confirmed","start":{"dateTime":"2026-11-24T01:00:00Z"},"end":{"dateTime":"2026-11-24T02:00:00Z"}},
+              {"id":"timed-after","status":"confirmed","start":{"dateTime":"2026-11-24T03:00:00Z"},"end":{"dateTime":"2026-11-24T04:00:00Z"}}
+            ]}
+            """#))
+        }
+        let events = try await makeClient(transport).events(calendarIDs: ["la@example.com"], from: morningStart, to: morningEnd)
+        #expect(events.map(\.id) == ["today", "timed-inside"])
+    }
+
+    @Test("Overlap matches the API's timeMin/timeMax rule")
+    func overlapRule() {
+        let base = Date(timeIntervalSince1970: 1_000_000)
+        func event(_ start: TimeInterval, _ end: TimeInterval) -> GoogleCalendarEvent {
+            GoogleCalendarEvent(id: "e", calendarID: "c", title: "", start: base + start, end: base + end, isAllDay: false,
+                                isCancelled: false, selfResponseStatus: .none, conferenceURL: nil, location: nil,
+                                description: nil, htmlLink: nil)
+        }
+        let from = base + 100, to = base + 200
+        #expect(GoogleCalendarClient.overlaps(event(50, 150), from: from, to: to))
+        #expect(GoogleCalendarClient.overlaps(event(150, 250), from: from, to: to))
+        #expect(!GoogleCalendarClient.overlaps(event(50, 100), from: from, to: to))
+        #expect(!GoogleCalendarClient.overlaps(event(200, 250), from: from, to: to))
+        #expect(GoogleCalendarClient.overlaps(event(100, 100), from: from, to: to))
+        #expect(!GoogleCalendarClient.overlaps(event(99, 99), from: from, to: to))
+    }
+
+    @Test("Hitting the page limit reports tooManyResults instead of partial data")
+    func pageLimit() async throws {
+        let transport = StubTransport { _ in (200, [:], json(#"{"items":[],"nextPageToken":"more"}"#)) }
+        await #expect(throws: GoogleCalendarError.tooManyResults) {
+            try await makeClient(transport).events(calendarIDs: ["primary"], from: from, to: to)
+        }
+        #expect(transport.requests.count == GoogleCalendarClient.maxPages)
+        await #expect(throws: GoogleCalendarError.tooManyResults) { try await makeClient(transport).calendars() }
+    }
+
+    @Test("A huge Retry-After is not waited for and does not trap")
+    func hugeRetryAfter() async throws {
+        let sleeps = Recorder<Duration>()
+        let transport = StubTransport { _ in (429, ["Retry-After": "1e30"], Data()) }
+        await #expect(throws: GoogleCalendarError.rateLimited(retryAfter: 1e30)) {
+            try await makeClient(transport, sleeps: sleeps).calendars()
+        }
+        #expect(sleeps.values.isEmpty)
+        #expect(transport.requests.count == 1)
+    }
+
+    @Test("Invalid Retry-After values fall back to exponential backoff", arguments: ["inf", "nan", "-5", "soon", "1e400"])
+    func invalidRetryAfter(header: String) async throws {
+        let sleeps = Recorder<Duration>()
+        let transport = StubTransport { _ in (429, ["Retry-After": header], Data()) }
+        let retry = RetryPolicy(maxRetries: 2, baseDelay: .milliseconds(100))
+        await #expect(throws: GoogleCalendarError.rateLimited(retryAfter: nil)) {
+            try await makeClient(transport, retry: retry, sleeps: sleeps).calendars()
+        }
+        #expect(sleeps.values == [.milliseconds(100), .milliseconds(200)])
     }
 }

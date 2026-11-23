@@ -65,19 +65,20 @@ public struct GoogleCalendarClient: Sendable {
 
     // MARK: Public API
 
-    /// All calendars in the user's calendar list.
+    /// All calendars in the user's calendar list, including ones hidden in the Google
+    /// Calendar UI (see ``GoogleCalendar/isHidden``).
     public func calendars() async throws -> [GoogleCalendar] {
         var result: [GoogleCalendar] = []
         var pageToken: String?
         for _ in 0..<Self.maxPages {
-            var query = [("maxResults", "250")]
+            var query = [("maxResults", "250"), ("showHidden", "true")]
             if let pageToken { query.append(("pageToken", pageToken)) }
             let page: CalendarListPage = try await get(path: ["users", "me", "calendarList"], query: query)
             result += (page.items ?? []).filter { $0.deleted != true }.map(GoogleCalendar.init)
             pageToken = page.nextPageToken
-            if pageToken == nil { break }
+            if pageToken == nil { return result }
         }
-        return result
+        throw GoogleCalendarError.tooManyResults
     }
 
     /// Events overlapping `start..<end` on the given calendars, with recurring events
@@ -106,15 +107,22 @@ public struct GoogleCalendarClient: Sendable {
         }
     }
 
+    /// Google filters all-day events at midnight in each *calendar's* time zone, while
+    /// this client maps them to midnight in `allDayTimeZone`. The query window is widened
+    /// by this much on both sides (more than any UTC offset difference) and the requested
+    /// overlap is reapplied after mapping.
+    static let allDayQueryPadding: TimeInterval = 26 * 3600
+
     func events(calendarID: String, from start: Date, to end: Date, includeCancelled: Bool) async throws -> [GoogleCalendarEvent] {
         var result: [GoogleCalendarEvent] = []
         var pageToken: String?
+        var complete = false
         for _ in 0..<Self.maxPages {
             var query = [
                 ("singleEvents", "true"),
                 ("orderBy", "startTime"),
-                ("timeMin", RFC3339.string(from: start)),
-                ("timeMax", RFC3339.string(from: end)),
+                ("timeMin", RFC3339.string(from: start.addingTimeInterval(-Self.allDayQueryPadding))),
+                ("timeMax", RFC3339.string(from: end.addingTimeInterval(Self.allDayQueryPadding))),
                 ("maxResults", String(pageSize)),
             ]
             if includeCancelled { query.append(("showDeleted", "true")) }
@@ -124,9 +132,19 @@ public struct GoogleCalendarClient: Sendable {
                 EventMapping.event(from: $0, calendarID: calendarID, allDayTimeZone: allDayTimeZone)
             }
             pageToken = page.nextPageToken
-            if pageToken == nil { break }
+            if pageToken == nil { complete = true; break }
         }
-        return includeCancelled ? result : result.filter { !$0.isCancelled }
+        guard complete else { throw GoogleCalendarError.tooManyResults }
+        return result.filter { event in
+            (includeCancelled || !event.isCancelled) && Self.overlaps(event, from: start, to: end)
+        }
+    }
+
+    /// Same rule as the API's timeMin/timeMax: ends after `from` and starts before `to`.
+    /// Zero-length events count when they start inside the range.
+    static func overlaps(_ event: GoogleCalendarEvent, from start: Date, to end: Date) -> Bool {
+        guard event.start < end else { return false }
+        return event.end > start || (event.end <= event.start && event.start >= start)
     }
 
     // MARK: Requests
@@ -154,9 +172,9 @@ public struct GoogleCalendarClient: Sendable {
     private func authorizedData(for url: URL) async throws -> Data {
         var refreshedAfter401 = false
         var retries = 0
+        var token = try await tokens.accessToken(forceRefresh: false)
         while true {
             try Task.checkCancellation()
-            let token = try await tokens.accessToken(forceRefresh: false)
             var request = URLRequest(url: url)
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -172,6 +190,8 @@ public struct GoogleCalendarClient: Sendable {
                     retries += 1
                     Self.logger.info("HTTP \(status) from Calendar API; retry \(retries) after \(delay)")
                     try await sleep(delay)
+                    // The access token may have expired while waiting.
+                    token = try await tokens.accessToken(forceRefresh: false)
                     continue
                 }
                 if isRateLimit { throw GoogleCalendarError.rateLimited(retryAfter: retryAfter) }
@@ -181,7 +201,7 @@ public struct GoogleCalendarClient: Sendable {
             case 401:
                 if refreshedAfter401 { throw GoogleCalendarError.unauthorized }
                 refreshedAfter401 = true
-                _ = try await tokens.accessToken(forceRefresh: true)
+                token = try await tokens.accessToken(forceRefresh: true)
                 continue
             case 403:
                 throw GoogleCalendarError.forbidden(reason: apiError.reason, message: apiError.message)
@@ -195,8 +215,12 @@ public struct GoogleCalendarClient: Sendable {
 
     private func delay(forRetry attempt: Int, retryAfter: TimeInterval?) -> Duration? {
         if let retryAfter {
-            let requested = Duration.milliseconds(Int64(retryAfter * 1000))
-            return requested <= retryPolicy.maxDelay ? requested : nil
+            // `retryAfter` is finite and non-negative (see `HTTPURLResponse.retryAfter`);
+            // compare in seconds before converting so huge values cannot overflow.
+            let components = retryPolicy.maxDelay.components
+            let maxSeconds = Double(components.seconds) + Double(components.attoseconds) / 1e18
+            guard retryAfter <= maxSeconds else { return nil }
+            return .milliseconds(Int64((retryAfter * 1000).rounded()))
         }
         let exponential = retryPolicy.baseDelay * (1 << min(attempt, 16))
         return min(exponential, retryPolicy.maxDelay)

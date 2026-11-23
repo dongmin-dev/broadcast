@@ -74,4 +74,28 @@ struct LoopbackTests {
         #expect(form["code"] == "c0de")
         #expect(form["redirect_uri"]?.hasPrefix("http://127.0.0.1:") == true)
     }
+
+    @Test("start() after stop() fails instead of waiting forever", .timeLimit(.minutes(1)))
+    func startAfterStop() async throws {
+        let server = try LoopbackRedirectServer(host: "127.0.0.1", port: nil, path: "/oauth2redirect")
+        server.stop()
+        await #expect(throws: CancellationError.self) { _ = try await server.start() }
+    }
+
+    @Test("Listens on IPv6 loopback")
+    func ipv6() async throws {
+        let configuration = GoogleAuthConfiguration(clientID: "id", redirectHost: "::1")
+        let agent = LoopbackAuthorizationUserAgent(timeout: .seconds(10), open: Self.browser(appending: "state=s&code=c"))
+        let redirect = try await agent.authorize(configuration: configuration) { redirectURI in
+            #expect(redirectURI.absoluteString.hasPrefix("http://[::1]:"))
+            return AuthorizationRequest(configuration: configuration, redirectURI: redirectURI).url
+        }
+        #expect(queryItems(redirect)["code"] == "c")
+    }
+
+    @Test("The browser page does not claim the sign-in succeeded")
+    func neutralPage() {
+        #expect(!LoopbackRedirectServer.page(succeeded: true).localizedCaseInsensitiveContains("signed in"))
+        #expect(LoopbackRedirectServer.page(succeeded: true).contains("Return to the app"))
+    }
 }
